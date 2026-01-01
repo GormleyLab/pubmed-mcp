@@ -32,11 +32,6 @@ This agent uses Claude's [MCP Connector](https://platform.claude.com/docs/en/age
    # Edit .env and add your Anthropic API key
    ```
 
-4. Load environment variables:
-   ```bash
-   source .env  # Or use python-dotenv
-   ```
-
 ## Usage
 
 ### Command Line

@@ -11,7 +11,12 @@ its internal knowledge for biomedical facts.
 
 import os
 import sys
+
+from dotenv import load_dotenv
 from anthropic import Anthropic
+
+# Load environment variables from .env file
+load_dotenv()
 
 # PubMed MCP Server URL
 PUBMED_MCP_SERVER_URL = "https://pubmed.mcp.claude.com/mcp"
