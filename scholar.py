@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-PubMed Research Agent using MCP Connector
+Scholar Gateway Research Agent
 
-An autonomous agent that searches PubMed to answer biomedical research questions.
-Uses the Anthropic MCP Connector to connect directly to the PubMed MCP server.
+An autonomous agent that searches Wiley's academic articles via Scholar Gateway.
+Uses the Anthropic MCP Connector to connect directly to the Scholar Gateway MCP server.
 
-The agent ONLY uses PubMed search results to answer questions - it does not rely on
-its internal knowledge for biomedical facts.
+The agent ONLY uses Scholar Gateway search results to answer questions - it does not
+rely on its internal knowledge for research facts.
 """
 
 import os
@@ -18,45 +18,51 @@ from anthropic import Anthropic
 # Load environment variables from .env file
 load_dotenv()
 
-# PubMed MCP Server URL
-PUBMED_MCP_SERVER_URL = "https://pubmed.mcp.claude.com/mcp"
+# Scholar Gateway MCP Server URL
+SCHOLAR_GATEWAY_MCP_SERVER_URL = "https://connector.scholargateway.ai/mcp"
 
-SYSTEM_PROMPT = """You are a biomedical research assistant that answers questions using ONLY information from PubMed.
+SYSTEM_PROMPT = """You are an academic research assistant that answers questions using ONLY information from Scholar Gateway.
+
+Scholar Gateway provides access to over 3 million articles from more than 1,300 Wiley journals across multiple disciplines including science, technology, medicine, social sciences, and humanities.
 
 CRITICAL RULES:
-1. You must ONLY use information retrieved from PubMed searches to answer questions.
-2. NEVER use your internal knowledge to provide biomedical facts, statistics, or claims.
-3. If you cannot find relevant information in PubMed, say so clearly.
-4. Always cite your sources with proper PubMed references.
+1. You must ONLY use information retrieved from Scholar Gateway searches to answer questions.
+2. NEVER use your internal knowledge to provide facts, statistics, or claims.
+3. If you cannot find relevant information, say so clearly.
+4. Always cite your sources with proper academic references.
 
 WORKFLOW:
 1. Analyze the user's research question
-2. Use search_articles to find relevant papers (try multiple search strategies if needed)
-3. Use get_article_metadata to get full abstracts for promising articles
-4. If needed, use find_related_articles to discover more relevant papers
-5. Synthesize findings ONLY from the retrieved articles
-6. Provide proper citations in your response
+2. Use semantic_search to find relevant articles (try multiple search strategies if needed)
+3. Analyze the returned article content and metadata
+4. Synthesize findings ONLY from the retrieved articles
+5. Provide proper citations in your response
 
 CITATION FORMAT:
 For each claim or finding, cite the source using:
 - Author names, title, journal, year
-- PMID and DOI when available
-- Example: "Smith et al. found that... (PMID: 12345678, DOI: 10.1000/example)"
+- DOI when available
+- Example: "Smith et al. found that... (DOI: 10.1002/example)"
 
-If PubMed searches return no results or insufficient information:
+SEARCH TIPS:
+- Use natural language queries - Scholar Gateway uses semantic search
+- Be specific about the topic or concept you're researching
+- Try different phrasings if initial searches yield insufficient results
+
+If searches return no results or insufficient information:
 - Try alternative search terms or broader queries
-- If still unsuccessful, clearly state that you could not find relevant research in PubMed
+- If still unsuccessful, clearly state what you searched and that you could not find relevant research
 - Do NOT fall back on internal knowledge to answer the question
 
-Remember: Your value is in providing evidence-based answers from peer-reviewed literature, not general knowledge."""
+Remember: Your value is in providing evidence-based answers from peer-reviewed academic literature, not general knowledge."""
 
 
-def run_pubmed_agent(research_question: str, verbose: bool = True) -> str:
+def run_scholar_agent(research_question: str, verbose: bool = True) -> str:
     """
-    Run the PubMed research agent to answer a question using the MCP Connector.
+    Run the Scholar Gateway research agent to answer a question using the MCP Connector.
 
     Args:
-        research_question: The biomedical research question to answer
+        research_question: The research question to answer
         verbose: Whether to print progress information
 
     Returns:
@@ -68,10 +74,31 @@ def run_pubmed_agent(research_question: str, verbose: bool = True) -> str:
 
     if verbose:
         print(f"\n{'='*60}")
-        print("PubMed Research Agent (MCP Connector)")
+        print("Scholar Gateway Research Agent (MCP Connector)")
         print(f"{'='*60}")
         print(f"\nResearch Question: {research_question}\n")
-        print("Searching PubMed...\n")
+        print("Searching Scholar Gateway...\n")
+
+    # Get Scholar Gateway token
+    scholar_gateway_token = os.environ.get("SCHOLAR_GATEWAY_TOKEN")
+    if not scholar_gateway_token:
+        return "Error: SCHOLAR_GATEWAY_TOKEN not set. Please configure your OAuth token."
+
+    mcp_servers = [
+        {
+            "type": "url",
+            "url": SCHOLAR_GATEWAY_MCP_SERVER_URL,
+            "name": "scholar_gateway",
+            "authorization_token": scholar_gateway_token,
+        }
+    ]
+
+    tools = [
+        {
+            "type": "mcp_toolset",
+            "mcp_server_name": "scholar_gateway",
+        }
+    ]
 
     # Agentic loop - continue until we get a final response
     iteration = 0
@@ -86,19 +113,8 @@ def run_pubmed_agent(research_question: str, verbose: bool = True) -> str:
             max_tokens=8096,
             system=SYSTEM_PROMPT,
             messages=messages,
-            mcp_servers=[
-                {
-                    "type": "url",
-                    "url": PUBMED_MCP_SERVER_URL,
-                    "name": "pubmed",
-                }
-            ],
-            tools=[
-                {
-                    "type": "mcp_toolset",
-                    "mcp_server_name": "pubmed",
-                }
-            ],
+            mcp_servers=mcp_servers,
+            tools=tools,
             betas=["mcp-client-2025-11-20"],
         )
 
@@ -116,16 +132,10 @@ def run_pubmed_agent(research_question: str, verbose: bool = True) -> str:
             elif block.type == "mcp_tool_use":
                 has_tool_use = True
                 if verbose:
-                    print(f"[Tool Call] {block.name}")
-                    if block.name == "search_articles":
-                        query = block.input.get("query", "")
+                    print(f"[scholar_gateway] {block.name}")
+                    if block.name == "semantic_search" or block.name == "semanticSearch":
+                        query = block.input.get("query", block.input.get("search_query", ""))
                         print(f"  Query: {query}")
-                    elif block.name == "get_article_metadata":
-                        pmids = block.input.get("pmids", [])
-                        print(f"  PMIDs: {', '.join(pmids[:5])}{'...' if len(pmids) > 5 else ''}")
-                    elif block.name == "get_full_text_article":
-                        pmc_ids = block.input.get("pmc_ids", [])
-                        print(f"  PMC IDs: {', '.join(pmc_ids[:3])}")
 
             elif block.type == "mcp_tool_result":
                 if verbose:
@@ -136,10 +146,10 @@ def run_pubmed_agent(research_question: str, verbose: bool = True) -> str:
                                 try:
                                     import json
                                     result_data = json.loads(content_block.text)
-                                    if "articles" in result_data:
+                                    if "results" in result_data:
+                                        print(f"  Found: {len(result_data['results'])} results")
+                                    elif "articles" in result_data:
                                         print(f"  Found: {len(result_data['articles'])} articles")
-                                    elif "total_count" in result_data:
-                                        print(f"  Total matches: {result_data.get('total_count', 'N/A')}")
                                 except (json.JSONDecodeError, TypeError):
                                     pass
                     print()
@@ -153,19 +163,13 @@ def run_pubmed_agent(research_question: str, verbose: bool = True) -> str:
             return final_text
 
         # If there were tool uses, continue the conversation
-        # The MCP connector handles tool execution, but we need to continue
-        # if Claude wants to do more
         if has_tool_use:
-            # Add assistant response to messages
             messages.append({"role": "assistant", "content": assistant_content})
-            # Continue the loop - Claude may need to make more calls
-            # or synthesize the results
             messages.append({
                 "role": "user",
                 "content": "Please continue analyzing the results and provide your answer."
             })
         else:
-            # Got a response without tool use
             if verbose:
                 print(f"\n{'='*60}")
                 print("Research Complete")
@@ -176,10 +180,10 @@ def run_pubmed_agent(research_question: str, verbose: bool = True) -> str:
 
 
 def main():
-    """Main entry point for the PubMed research agent."""
+    """Main entry point for the Scholar Gateway research agent."""
     print("\n" + "=" * 60)
-    print("  PubMed Research Agent")
-    print("  Answers biomedical questions using PubMed literature")
+    print("  Scholar Gateway Research Agent")
+    print("  Answers questions using Wiley academic articles")
     print("  Powered by Anthropic MCP Connector")
     print("=" * 60 + "\n")
 
@@ -190,13 +194,20 @@ def main():
         print("  export ANTHROPIC_API_KEY='your-api-key'")
         sys.exit(1)
 
+    # Check for Scholar Gateway token
+    if not os.environ.get("SCHOLAR_GATEWAY_TOKEN"):
+        print("Error: SCHOLAR_GATEWAY_TOKEN environment variable not set.")
+        print("Please set your Scholar Gateway OAuth token.")
+        print("See README.md for instructions on obtaining a token.")
+        sys.exit(1)
+
     # Get research question from command line or prompt
     if len(sys.argv) > 1:
         question = " ".join(sys.argv[1:])
     else:
-        print("Enter your biomedical research question:")
-        print("(Examples: 'What are the latest treatments for Type 2 diabetes?'")
-        print("          'What is the evidence for mRNA vaccines in cancer treatment?')")
+        print("Enter your research question:")
+        print("(Examples: 'What are recent advances in organic solar cells?'")
+        print("          'What does the research say about remote work productivity?')")
         print()
         question = input("> ").strip()
 
@@ -205,7 +216,7 @@ def main():
             sys.exit(0)
 
     # Run the agent
-    response = run_pubmed_agent(question)
+    response = run_scholar_agent(question)
 
     print("\n" + "=" * 60)
     print("  Answer")
