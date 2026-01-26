@@ -110,7 +110,7 @@ def run_paperrag_agent(research_question: str, verbose: bool = True) -> str:
 
     # Agentic loop - continue until we get a final response
     iteration = 0
-    max_iterations = 2  # Safety limit
+    max_iterations = 10  # Safety limit
 
     while iteration < max_iterations:
         iteration += 1
