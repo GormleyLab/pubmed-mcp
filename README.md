@@ -4,23 +4,26 @@ Autonomous agents that search academic databases to answer research questions us
 
 ## Overview
 
-Two standalone research agents, each connecting to a different academic database:
+Four agents, each connecting to different academic databases:
 
 | Program | Database | Coverage | Authentication |
 |---------|----------|----------|----------------|
 | `pubmed.py` | PubMed | 36M+ biomedical citations | None required |
 | `scholar.py` | Scholar Gateway | 3M+ Wiley articles | OAuth required |
+| `jiminy.py` | Paper RAG | Personal paper library | API key required |
+| `research.py` | All three | Combined coverage | All keys recommended |
 
-Both agents:
+All agents:
 - **Only use database results** - never rely on internal knowledge
 - **Autonomously research** - make multiple tool calls to find relevant papers
-- **Provide citations** - include PMIDs, DOIs, and full references
+- **Provide citations** - include PMIDs, DOIs, BibTeX keys, and full references
 
 ## Requirements
 
 - Python 3.10+
 - Anthropic API key
 - Scholar Gateway token (for `scholar.py` only)
+- Paper RAG API key (for `jiminy.py` only)
 
 ## Installation
 
@@ -46,6 +49,12 @@ Both agents:
 | Variable | Description |
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Your Anthropic API key ([get one here](https://console.anthropic.com/)) |
+
+### Required for `jiminy.py` only
+
+| Variable | Description |
+|----------|-------------|
+| `PAPERRAG_API_KEY` | API key for the Paper RAG MCP server |
 
 ### Required for `scholar.py` only
 
@@ -91,6 +100,24 @@ python pubmed.py
 - Medical treatment evidence
 - Drug mechanisms and pharmacology
 
+### Paper RAG Agent (Jiminy)
+
+Search your personal academic paper library:
+
+```bash
+# With a question as argument
+python jiminy.py "What papers discuss polymer nanoparticles for drug delivery?"
+
+# Interactive mode
+python jiminy.py
+```
+
+**Best for:**
+- Questions about papers in your indexed library
+- Finding connections between papers you've collected
+- Generating bibliographies from your paper collection
+- Semantic search across your personal research corpus
+
 ### Scholar Gateway Agent
 
 Search Wiley's academic articles:
@@ -109,12 +136,36 @@ python scholar.py
 - Interdisciplinary research
 - Social sciences and humanities
 
+### Unified Research Agent
+
+Search across all three databases simultaneously:
+
+```bash
+# With a question as argument
+python research.py "What are the latest treatments for Type 2 diabetes?"
+
+# Interactive mode
+python research.py
+```
+
+**Best for:**
+- Comprehensive literature searches across multiple sources
+- Cross-referencing findings between databases
+- When you're unsure which database has the most relevant content
+
+**Note:** Requires `ANTHROPIC_API_KEY`. `PAPERRAG_API_KEY` and `SCHOLAR_GATEWAY_TOKEN` are recommended but optional — the agent will use whichever databases are configured.
+
 ## Example Questions
 
 ### PubMed (`pubmed.py`)
 - "What are the recent findings on GLP-1 receptor agonists for weight loss?"
 - "What is the current evidence for CRISPR gene therapy in sickle cell disease?"
 - "What are the risk factors for long COVID?"
+
+### Paper RAG (`jiminy.py`)
+- "What papers discuss polymer nanoparticles for drug delivery?"
+- "Find papers about machine learning in materials science"
+- "What's in my library about CRISPR applications?"
 
 ### Scholar Gateway (`scholar.py`)
 - "What are recent advances in organic solar cell efficiency?"
@@ -133,12 +184,11 @@ python scholar.py
 │  Claude Agent   │────▶│  MCP Connector (Anthropic API)   │
 └────────┬────────┘     └──────────────────────────────────┘
          │                        │
-         │              ┌─────────┴─────────┐
-         │              ▼                   ▼
-         │      ┌───────────────┐   ┌───────────────────┐
-         │      │    PubMed     │   │  Scholar Gateway  │
-         │      │  (pubmed.py)  │   │   (scholar.py)    │
-         │      └───────────────┘   └───────────────────┘
+         │              ┌─────────┼─────────┐
+         │              ▼         ▼         ▼
+         │      ┌──────────┐ ┌──────────┐ ┌───────────────────┐
+         │      │  PubMed  │ │ Paper RAG│ │  Scholar Gateway  │
+         │      └──────────┘ └──────────┘ └───────────────────┘
          │
          ▼
 ┌─────────────────┐
@@ -164,6 +214,16 @@ python scholar.py
 | `convert_article_ids` | Convert between PMID, PMCID, and DOI |
 | `lookup_article_by_citation` | Find articles by citation details |
 
+### Paper RAG Tools (`jiminy.py`)
+
+| Tool | Description |
+|------|-------------|
+| `search_papers` | Semantic search through indexed papers |
+| `get_paper_details` | Get full metadata for a specific paper |
+| `database_stats` | Get statistics about the paper database |
+| `list_recent_papers` | Show recently added papers |
+| `generate_bibliography` | Create a .bib file from paper keys |
+
 ### Scholar Gateway Tools (`scholar.py`)
 
 | Tool | Description |
@@ -181,11 +241,27 @@ response = run_pubmed_agent(
     verbose=True
 )
 
+# Paper RAG (Jiminy)
+from jiminy import run_paperrag_agent
+
+response = run_paperrag_agent(
+    "What papers discuss polymer nanoparticles for drug delivery?",
+    verbose=True
+)
+
 # Scholar Gateway
 from scholar import run_scholar_agent
 
 response = run_scholar_agent(
     "What are recent advances in renewable energy storage?",
+    verbose=True
+)
+
+# Unified (all databases)
+from research import run_research_agent
+
+response = run_research_agent(
+    "What are the latest treatments for Type 2 diabetes?",
     verbose=True
 )
 ```
