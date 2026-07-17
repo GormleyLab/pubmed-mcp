@@ -15,11 +15,24 @@ import sys
 from dotenv import load_dotenv
 from anthropic import Anthropic
 
+from scholar_auth import (
+    SCHOLAR_GATEWAY_MCP_URL,
+    get_scholar_gateway_token,
+    has_client_credentials,
+)
+
 # Load environment variables from .env file
 load_dotenv()
 
-# Scholar Gateway MCP Server URL
-SCHOLAR_GATEWAY_MCP_SERVER_URL = "https://connector.scholargateway.ai/mcp"
+# Ensure Unicode answers (Greek letters, em dashes, etc.) print on Windows
+# consoles, whose default cp1252 encoding raises UnicodeEncodeError otherwise.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, ValueError):
+    pass
+
+# Scholar Gateway MCP Server URL (Wiley custom connector)
+SCHOLAR_GATEWAY_MCP_SERVER_URL = SCHOLAR_GATEWAY_MCP_URL
 
 SYSTEM_PROMPT = """You are an academic research assistant that answers questions using ONLY information from Scholar Gateway.
 
@@ -79,10 +92,21 @@ def run_scholar_agent(research_question: str, verbose: bool = True) -> str:
         print(f"\nResearch Question: {research_question}\n")
         print("Searching Scholar Gateway...\n")
 
-    # Get Scholar Gateway token
-    scholar_gateway_token = os.environ.get("SCHOLAR_GATEWAY_TOKEN")
-    if not scholar_gateway_token:
-        return "Error: SCHOLAR_GATEWAY_TOKEN not set. Please configure your OAuth token."
+    # Get a Scholar Gateway token. Prefer the client_credentials flow (custom
+    # connector); fall back to a legacy static token if creds are not configured.
+    if has_client_credentials():
+        try:
+            scholar_gateway_token = get_scholar_gateway_token()
+        except RuntimeError as exc:
+            return f"Error: could not obtain Scholar Gateway token. {exc}"
+    else:
+        scholar_gateway_token = os.environ.get("SCHOLAR_GATEWAY_TOKEN")
+        if not scholar_gateway_token:
+            return (
+                "Error: no Scholar Gateway credentials found. Set "
+                "SCHOLAR_GATEWAY_CLIENT_ID and SCHOLAR_GATEWAY_CLIENT_SECRET "
+                "(preferred), or a legacy SCHOLAR_GATEWAY_TOKEN, in your .env file."
+            )
 
     mcp_servers = [
         {
@@ -100,16 +124,18 @@ def run_scholar_agent(research_question: str, verbose: bool = True) -> str:
         }
     ]
 
-    # Agentic loop - continue until we get a final response
+    # Agentic loop. The server-side MCP connector usually finishes in a single
+    # turn (tools run server-side), so this rarely iterates more than once; the
+    # cap only bounds pause_turn resumptions.
     iteration = 0
-    max_iterations = 20  # Safety limit
+    max_iterations = 5  # Safety limit
 
     while iteration < max_iterations:
         iteration += 1
 
         # Call Claude with MCP Connector
         response = client.beta.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-5",
             max_tokens=8096,
             system=SYSTEM_PROMPT,
             messages=messages,
@@ -154,27 +180,28 @@ def run_scholar_agent(research_question: str, verbose: bool = True) -> str:
                                     pass
                     print()
 
-        # Check if we're done (no more tool use needed)
-        if response.stop_reason == "end_turn" and not has_tool_use:
+        # The MCP connector runs tools server-side within a single turn, so one
+        # response can contain the tool calls, their results, AND the final answer.
+        # Return as soon as the model finishes its turn.
+        if response.stop_reason == "end_turn":
             if verbose:
                 print(f"\n{'='*60}")
                 print("Research Complete")
                 print(f"{'='*60}\n")
             return final_text
 
-        # If there were tool uses, continue the conversation
-        if has_tool_use:
+        # Long-running server tool use may pause mid-turn; resume it by resending
+        # the assistant's partial content (no canned "continue" prompt needed).
+        if response.stop_reason == "pause_turn":
             messages.append({"role": "assistant", "content": assistant_content})
-            messages.append({
-                "role": "user",
-                "content": "Please continue analyzing the results and provide your answer."
-            })
-        else:
-            if verbose:
-                print(f"\n{'='*60}")
-                print("Research Complete")
-                print(f"{'='*60}\n")
-            return final_text
+            continue
+
+        # Any other stop reason (e.g. max_tokens): return whatever text we have.
+        if verbose:
+            print(f"\n{'='*60}")
+            print("Research Complete")
+            print(f"{'='*60}\n")
+        return final_text
 
     return "Error: Maximum iterations reached without completing the research."
 
@@ -194,11 +221,16 @@ def main():
         print("  export ANTHROPIC_API_KEY='your-api-key'")
         sys.exit(1)
 
-    # Check for Scholar Gateway token
-    if not os.environ.get("SCHOLAR_GATEWAY_TOKEN"):
-        print("Error: SCHOLAR_GATEWAY_TOKEN environment variable not set.")
-        print("Please set your Scholar Gateway OAuth token.")
-        print("See README.md for instructions on obtaining a token.")
+    # Check for Scholar Gateway credentials (client_credentials preferred,
+    # legacy static token accepted as a fallback).
+    if not has_client_credentials() and not os.environ.get("SCHOLAR_GATEWAY_TOKEN"):
+        print("Error: no Scholar Gateway credentials configured.")
+        print(
+            "Set SCHOLAR_GATEWAY_CLIENT_ID and SCHOLAR_GATEWAY_CLIENT_SECRET "
+            "(preferred),"
+        )
+        print("or a legacy SCHOLAR_GATEWAY_TOKEN, in your .env file.")
+        print("See README.md for details.")
         sys.exit(1)
 
     # Get research question from command line or prompt

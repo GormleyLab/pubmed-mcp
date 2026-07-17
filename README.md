@@ -58,13 +58,39 @@ All agents:
 
 ### Required for `scholar.py` only
 
+Two ways to authenticate — `scholar.py` prefers the first and falls back to the second:
+
 | Variable | Description |
 |----------|-------------|
-| `SCHOLAR_GATEWAY_TOKEN` | OAuth token for Scholar Gateway |
+| `SCHOLAR_GATEWAY_CLIENT_ID` | Client ID for the Wiley custom connector (preferred) |
+| `SCHOLAR_GATEWAY_CLIENT_SECRET` | Client Secret for the Wiley custom connector (preferred) |
+| `SCHOLAR_GATEWAY_TOKEN` | Legacy static OAuth token (fallback, optional) |
 
-### Getting a Scholar Gateway Token
+### Scholar Gateway authentication (client_credentials — preferred)
 
-Scholar Gateway uses OAuth 2.1 via CONNECT SSO. Use the MCP Inspector to obtain an access token:
+Wiley's custom connector supports the OAuth2 **client_credentials** grant. This is a
+non-interactive, machine-to-machine flow: `scholar.py` exchanges your Client ID and
+Client Secret for a short-lived access token on every run, so there is no browser
+login and no token to manually refresh.
+
+1. Add your credentials to `.env` (these are secrets — `.env` is git-ignored):
+   ```
+   SCHOLAR_GATEWAY_CLIENT_ID=your-client-id
+   SCHOLAR_GATEWAY_CLIENT_SECRET=your-client-secret
+   ```
+2. Verify the OAuth step in isolation before running the agent:
+   ```bash
+   python scholar_auth.py
+   ```
+   A masked token is printed on success. The token exchange runs against
+   `https://custom-connector-v1.scholargateway.ai/oauth2/token`, and the agent
+   connects to `https://custom-connector-v1.scholargateway.ai/mcp`.
+
+### Legacy: getting a Scholar Gateway token via MCP Inspector (fallback)
+
+If you don't have client credentials, `scholar.py` falls back to a static
+`SCHOLAR_GATEWAY_TOKEN`. Scholar Gateway also supports OAuth 2.1 via CONNECT SSO;
+use the MCP Inspector to obtain an access token:
 
 ```bash
 npx @modelcontextprotocol/inspector
@@ -78,7 +104,8 @@ npx @modelcontextprotocol/inspector
 6. Copy the `access_token` value from the result
 7. Paste it as the value of `SCHOLAR_GATEWAY_TOKEN` in your `.env` file
 
-**Note:** OAuth tokens expire. You'll need to repeat this process when your token expires.
+**Note:** These static tokens expire. You'll need to repeat this process when the
+token expires — which is why the client_credentials flow above is preferred.
 
 ## Usage
 

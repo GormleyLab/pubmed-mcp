@@ -17,6 +17,13 @@ from anthropic import Anthropic
 # Load environment variables from .env file
 load_dotenv()
 
+# Ensure Unicode answers (Greek letters, em dashes, etc.) print on Windows
+# consoles, whose default cp1252 encoding raises UnicodeEncodeError otherwise.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, ValueError):
+    pass
+
 # Paper RAG MCP Server URL
 PAPERRAG_MCP_SERVER_URL = "https://m76rjhx9i3.us-east-1.awsapprunner.com/mcp"
 
@@ -108,16 +115,18 @@ def run_paperrag_agent(research_question: str, verbose: bool = True) -> str:
         }
     ]
 
-    # Agentic loop - continue until we get a final response
+    # Agentic loop. The server-side MCP connector usually finishes in a single
+    # turn (tools run server-side), so this rarely iterates more than once; the
+    # cap only bounds pause_turn resumptions.
     iteration = 0
-    max_iterations = 10  # Safety limit
+    max_iterations = 5  # Safety limit
 
     while iteration < max_iterations:
         iteration += 1
 
         # Call Claude with MCP Connector
         response = client.beta.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-5",
             max_tokens=8096,
             system=SYSTEM_PROMPT,
             messages=messages,
@@ -177,29 +186,28 @@ def run_paperrag_agent(research_question: str, verbose: bool = True) -> str:
                                     pass
                     print()
 
-        # Check if we're done (no more tool use needed)
-        if response.stop_reason == "end_turn" and not has_tool_use:
+        # The MCP connector runs tools server-side within a single turn, so one
+        # response can contain the tool calls, their results, AND the final answer.
+        # Return as soon as the model finishes its turn.
+        if response.stop_reason == "end_turn":
             if verbose:
                 print(f"\n{'=' * 60}")
                 print("Research Complete")
                 print(f"{'=' * 60}\n")
             return final_text
 
-        # If there were tool uses, continue the conversation
-        if has_tool_use:
+        # Long-running server tool use may pause mid-turn; resume it by resending
+        # the assistant's partial content (no canned "continue" prompt needed).
+        if response.stop_reason == "pause_turn":
             messages.append({"role": "assistant", "content": assistant_content})
-            messages.append(
-                {
-                    "role": "user",
-                    "content": "Please continue analyzing the results and provide your answer.",
-                }
-            )
-        else:
-            if verbose:
-                print(f"\n{'=' * 60}")
-                print("Research Complete")
-                print(f"{'=' * 60}\n")
-            return final_text
+            continue
+
+        # Any other stop reason (e.g. max_tokens): return whatever text we have.
+        if verbose:
+            print(f"\n{'=' * 60}")
+            print("Research Complete")
+            print(f"{'=' * 60}\n")
+        return final_text
 
     return "Error: Maximum iterations reached without completing the research."
 
