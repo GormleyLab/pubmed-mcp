@@ -8,8 +8,12 @@ Uses the Anthropic MCP Connector to connect directly to the Paper RAG MCP server
 The agent uses your indexed papers to answer questions with proper citations.
 """
 
+import json
 import os
 import sys
+import time
+import urllib.error
+import urllib.request
 
 from dotenv import load_dotenv
 from anthropic import Anthropic
@@ -26,6 +30,89 @@ except (AttributeError, ValueError):
 
 # Paper RAG MCP Server URL
 PAPERRAG_MCP_SERVER_URL = "https://m76rjhx9i3.us-east-1.awsapprunner.com/mcp"
+
+# The Paper RAG server runs on AWS App Runner, which scales to zero when idle.
+# The first request after idle triggers a cold start (loading the embedding
+# model + vector DB) that can take a few minutes, which would blow past the
+# Anthropic client's request timeout mid-agent-turn. To tolerate that, we warm
+# the server with a direct, tiny search BEFORE the agent turn — using a generous
+# timeout of its own — so the connector's first tool call hits a warm instance.
+WARMUP_TIMEOUT_S = 300.0
+
+
+def warm_up_paperrag(api_key: str, verbose: bool = True) -> bool:
+    """Wake the (scale-to-zero) Paper RAG server before the real agent turn.
+
+    Sends a direct MCP handshake plus a tiny ``search_papers`` call, which forces
+    all lazy-loading (embedding model, vector DB) so the subsequent agent turn
+    runs against a warm instance within the normal request timeout. Best-effort:
+    on failure it warns and lets the agent proceed anyway.
+
+    Returns True if the warm-up search completed, False otherwise.
+    """
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+
+    def _post(payload: dict, ignore_errors: bool = False):
+        req = urllib.request.Request(
+            PAPERRAG_MCP_SERVER_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=WARMUP_TIMEOUT_S) as resp:
+                return resp.read()
+        except (urllib.error.URLError, TimeoutError):
+            if ignore_errors:
+                return None
+            raise
+
+    if verbose:
+        print("Warming up Paper RAG server (cold starts can take a minute)...")
+    start = time.monotonic()
+    try:
+        # Handshake is best-effort; the stateless server accepts tool calls
+        # without a session, so only the search itself must succeed.
+        _post(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "jiminy-warmup", "version": "1.0"},
+                },
+            },
+            ignore_errors=True,
+        )
+        _post({"jsonrpc": "2.0", "method": "notifications/initialized"}, ignore_errors=True)
+        # This search forces the embedding model + vector DB to load.
+        _post(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "search_papers", "arguments": {"query": "warmup", "n_results": 1}},
+            }
+        )
+        elapsed = time.monotonic() - start
+        if verbose:
+            print(f"Paper RAG server ready ({elapsed:.1f}s).\n")
+        return True
+    except (urllib.error.URLError, TimeoutError) as exc:
+        elapsed = time.monotonic() - start
+        if verbose:
+            print(
+                f"Warning: warm-up did not complete after {elapsed:.1f}s ({exc}). "
+                "Proceeding anyway — the first search may be slow.\n"
+            )
+        return False
+
 
 SYSTEM_PROMPT = """You are an academic research assistant that answers questions using ONLY information from the Paper RAG database.
 
@@ -101,6 +188,10 @@ def run_paperrag_agent(research_question: str, verbose: bool = True) -> str:
     paperrag_api_key = os.environ.get("PAPERRAG_API_KEY")
     if not paperrag_api_key:
         return "Error: PAPERRAG_API_KEY not set. Please configure your API key in .env"
+
+    # Wake the scale-to-zero server before the agent turn so the connector's
+    # first tool call hits a warm instance (see warm_up_paperrag).
+    warm_up_paperrag(paperrag_api_key, verbose=verbose)
 
     mcp_servers = [
         {
