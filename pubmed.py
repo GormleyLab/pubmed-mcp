@@ -77,7 +77,10 @@ def run_pubmed_agent(research_question: str, verbose: bool = True) -> str:
     Returns:
         The agent's response with citations
     """
-    client = Anthropic()
+    # Explicit timeout + limited retries so a transient stall in the MCP
+    # connector fails fast and visibly instead of hanging on the SDK defaults
+    # (~10 min timeout with silent retries).
+    client = Anthropic(timeout=120.0, max_retries=1)
 
     messages = [{"role": "user", "content": research_question}]
 
