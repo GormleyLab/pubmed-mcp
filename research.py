@@ -23,6 +23,7 @@ from scholar_auth import (
     get_scholar_gateway_token,
     has_client_credentials,
 )
+from paperrag_warmup import PAPERRAG_MCP_SERVER_URL, warm_up_paperrag
 
 # Load environment variables from .env file
 load_dotenv()
@@ -36,7 +37,7 @@ except (AttributeError, ValueError):
 
 # MCP Server URLs
 PUBMED_MCP_SERVER_URL = "https://pubmed.mcp.claude.com/mcp"
-PAPERRAG_MCP_SERVER_URL = "https://m76rjhx9i3.us-east-1.awsapprunner.com/mcp"
+# PAPERRAG_MCP_SERVER_URL is imported from paperrag_warmup (single source of truth)
 SCHOLAR_GATEWAY_MCP_SERVER_URL = SCHOLAR_GATEWAY_MCP_URL  # Wiley custom connector
 
 SYSTEM_PROMPT = """You are an academic research assistant that answers questions using ONLY information from multiple research databases.
@@ -132,6 +133,11 @@ def run_research_agent(research_question: str, verbose: bool = True) -> str:
 
     # Get API keys/tokens from environment variables
     paperrag_api_key = os.environ.get("PAPERRAG_API_KEY")
+
+    # Wake the scale-to-zero Paper RAG server before the agent turn so the
+    # connector's first tool call hits a warm instance (see warm_up_paperrag).
+    if paperrag_api_key:
+        warm_up_paperrag(paperrag_api_key, verbose=verbose)
 
     # Obtain a Scholar Gateway token. Prefer the client_credentials flow (custom
     # connector); fall back to a legacy static token. If neither is available, we

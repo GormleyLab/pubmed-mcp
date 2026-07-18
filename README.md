@@ -228,6 +228,33 @@ python research.py
 3. **Agentic Loop**: Claude autonomously calls tools until it has enough information
 4. **Citation Synthesis**: Final response includes proper academic citations
 
+### Paper RAG cold starts and warm-up
+
+The Paper RAG server (used by `jiminy.py` and `research.py`) runs on **AWS App
+Runner, which scales to zero when idle**. The first request after an idle period
+— or right after a deploy — triggers a **cold start** while the instance loads
+the embedding model and vector database. This can take up to a couple of minutes.
+
+If a cold start happens *during* an agent turn, the connector's first tool call
+can stall long enough to exceed the Anthropic client's request timeout, which
+previously surfaced as a hang or an errored first search. Two safeguards address
+this:
+
+- **Warm-up before the turn.** `jiminy.py` and `research.py` call
+  `warm_up_paperrag()` (in `paperrag_warmup.py`) before invoking the agent. It
+  sends a direct, tiny `search_papers` request — with its own generous 300s
+  timeout — that forces the server to finish cold-starting, so the actual agent
+  turn runs against a warm instance. You'll see `Warming up Paper RAG server...`
+  followed by `Paper RAG server ready (N.Ns)`; on a warm server this is ~1s, on a
+  cold start it reflects the real spin-up time. The warm-up is best-effort — if it
+  can't complete it prints a warning and proceeds.
+- **Bounded client timeout.** All agents construct the Anthropic client with
+  `timeout=120.0, max_retries=1`, so any residual stall fails fast and visibly
+  instead of hanging on the SDK defaults (~10 min with silent retries).
+
+To avoid cold starts entirely, configure the App Runner service with a minimum
+of **1 instance** (keeps one warm) rather than scaling to zero.
+
 ## Available Tools
 
 ### PubMed Tools (`pubmed.py`)
