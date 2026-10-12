@@ -3,22 +3,26 @@
 Scholar Gateway Research Agent
 
 An autonomous agent that searches Wiley's academic articles via Scholar Gateway.
-Uses the Anthropic MCP Connector to connect directly to the Scholar Gateway MCP server.
+Connects to the Scholar Gateway MCP server client-side (see scholar_auth.py).
 
 The agent ONLY uses Scholar Gateway search results to answer questions - it does not
 rely on its internal knowledge for research facts.
 """
 
+import json
 import os
 import sys
+
+import httpx
 
 from dotenv import load_dotenv
 from anthropic import Anthropic
 
 from scholar_auth import (
-    SCHOLAR_GATEWAY_MCP_URL,
-    get_scholar_gateway_token,
-    has_client_credentials,
+    API_KEY_ENV,
+    ScholarGatewayClient,
+    get_scholar_gateway_api_key,
+    has_api_key,
 )
 
 # Load environment variables from .env file
@@ -30,9 +34,6 @@ try:
     sys.stdout.reconfigure(encoding="utf-8")
 except (AttributeError, ValueError):
     pass
-
-# Scholar Gateway MCP Server URL (Wiley custom connector)
-SCHOLAR_GATEWAY_MCP_SERVER_URL = SCHOLAR_GATEWAY_MCP_URL
 
 SYSTEM_PROMPT = """You are an academic research assistant that answers questions using ONLY information from Scholar Gateway.
 
@@ -46,7 +47,7 @@ CRITICAL RULES:
 
 WORKFLOW:
 1. Analyze the user's research question
-2. Use semantic_search to find relevant articles (try multiple search strategies if needed)
+2. Use search_wiley_fulltext to find relevant articles (try multiple search strategies if needed)
 3. Analyze the returned article content and metadata
 4. Synthesize findings ONLY from the retrieved articles
 5. Provide proper citations in your response
@@ -72,7 +73,7 @@ Remember: Your value is in providing evidence-based answers from peer-reviewed a
 
 def run_scholar_agent(research_question: str, verbose: bool = True) -> str:
     """
-    Run the Scholar Gateway research agent to answer a question using the MCP Connector.
+    Run the Scholar Gateway research agent to answer a question.
 
     Args:
         research_question: The research question to answer
@@ -81,8 +82,8 @@ def run_scholar_agent(research_question: str, verbose: bool = True) -> str:
     Returns:
         The agent's response with citations
     """
-    # Explicit timeout + limited retries so a transient stall in the MCP
-    # connector fails fast and visibly instead of hanging on the SDK defaults
+    # Explicit timeout + limited retries so a transient API stall
+    # fails fast and visibly instead of hanging on the SDK defaults
     # (~10 min timeout with silent retries).
     client = Anthropic(timeout=120.0, max_retries=1)
 
@@ -90,121 +91,73 @@ def run_scholar_agent(research_question: str, verbose: bool = True) -> str:
 
     if verbose:
         print(f"\n{'='*60}")
-        print("Scholar Gateway Research Agent (MCP Connector)")
+        print("Scholar Gateway Research Agent")
         print(f"{'='*60}")
         print(f"\nResearch Question: {research_question}\n")
         print("Searching Scholar Gateway...\n")
 
-    # Get a Scholar Gateway token. Prefer the client_credentials flow (custom
-    # connector); fall back to a legacy static token if creds are not configured.
-    if has_client_credentials():
-        try:
-            scholar_gateway_token = get_scholar_gateway_token()
-        except RuntimeError as exc:
-            return f"Error: could not obtain Scholar Gateway token. {exc}"
-    else:
-        scholar_gateway_token = os.environ.get("SCHOLAR_GATEWAY_TOKEN")
-        if not scholar_gateway_token:
-            return (
-                "Error: no Scholar Gateway credentials found. Set "
-                "SCHOLAR_GATEWAY_CLIENT_ID and SCHOLAR_GATEWAY_CLIENT_SECRET "
-                "(preferred), or a legacy SCHOLAR_GATEWAY_TOKEN, in your .env file."
+    # Connect to Scholar Gateway client-side: the v2 server requires an
+    # X-API-Key header, which the server-side MCP connector cannot send.
+    try:
+        scholar_gateway = ScholarGatewayClient(get_scholar_gateway_api_key())
+        tools = scholar_gateway.list_tools()
+    except (RuntimeError, httpx.HTTPError) as exc:
+        return f"Error: could not connect to Scholar Gateway. {exc}"
+
+    # Agentic loop: the model requests searches, we run them against Scholar
+    # Gateway and send back the results until it finishes its answer.
+    iteration = 0
+    max_iterations = 10  # Safety limit
+
+    with scholar_gateway:
+        while iteration < max_iterations:
+            iteration += 1
+
+            response = client.messages.create(
+                model="claude-sonnet-5",
+                max_tokens=8096,
+                system=SYSTEM_PROMPT,
+                messages=messages,
+                tools=tools,
             )
 
-    mcp_servers = [
-        {
-            "type": "url",
-            "url": SCHOLAR_GATEWAY_MCP_SERVER_URL,
-            "name": "scholar_gateway",
-            "authorization_token": scholar_gateway_token,
-        }
-    ]
+            final_text = "".join(
+                block.text for block in response.content if block.type == "text"
+            )
 
-    tools = [
-        {
-            "type": "mcp_toolset",
-            "mcp_server_name": "scholar_gateway",
-        }
-    ]
+            if response.stop_reason != "tool_use":
+                if verbose:
+                    print(f"\n{'='*60}")
+                    print("Research Complete")
+                    print(f"{'='*60}\n")
+                return final_text
 
-    # Agentic loop. The server-side MCP connector usually finishes in a single
-    # turn (tools run server-side), so this rarely iterates more than once; the
-    # cap only bounds pause_turn resumptions.
-    iteration = 0
-    max_iterations = 5  # Safety limit
-
-    while iteration < max_iterations:
-        iteration += 1
-
-        # Call Claude with MCP Connector
-        response = client.beta.messages.create(
-            model="claude-sonnet-5",
-            max_tokens=8096,
-            system=SYSTEM_PROMPT,
-            messages=messages,
-            mcp_servers=mcp_servers,
-            tools=tools,
-            betas=["mcp-client-2025-11-20"],
-        )
-
-        # Process response content
-        assistant_content = []
-        has_tool_use = False
-        final_text = ""
-
-        for block in response.content:
-            assistant_content.append(block)
-
-            if block.type == "text":
-                final_text += block.text
-
-            elif block.type == "mcp_tool_use":
-                has_tool_use = True
+            messages.append({"role": "assistant", "content": response.content})
+            tool_results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
                 if verbose:
                     print(f"[scholar_gateway] {block.name}")
-                    if block.name == "semantic_search" or block.name == "semanticSearch":
-                        query = block.input.get("query", block.input.get("search_query", ""))
-                        print(f"  Query: {query}")
-
-            elif block.type == "mcp_tool_result":
-                if verbose:
-                    # Show brief result info
-                    if hasattr(block, "content") and block.content:
-                        for content_block in block.content:
-                            if hasattr(content_block, "text"):
-                                try:
-                                    import json
-                                    result_data = json.loads(content_block.text)
-                                    if "results" in result_data:
-                                        print(f"  Found: {len(result_data['results'])} results")
-                                    elif "articles" in result_data:
-                                        print(f"  Found: {len(result_data['articles'])} articles")
-                                except (json.JSONDecodeError, TypeError):
-                                    pass
-                    print()
-
-        # The MCP connector runs tools server-side within a single turn, so one
-        # response can contain the tool calls, their results, AND the final answer.
-        # Return as soon as the model finishes its turn.
-        if response.stop_reason == "end_turn":
-            if verbose:
-                print(f"\n{'='*60}")
-                print("Research Complete")
-                print(f"{'='*60}\n")
-            return final_text
-
-        # Long-running server tool use may pause mid-turn; resume it by resending
-        # the assistant's partial content (no canned "continue" prompt needed).
-        if response.stop_reason == "pause_turn":
-            messages.append({"role": "assistant", "content": assistant_content})
-            continue
-
-        # Any other stop reason (e.g. max_tokens): return whatever text we have.
-        if verbose:
-            print(f"\n{'='*60}")
-            print("Research Complete")
-            print(f"{'='*60}\n")
-        return final_text
+                    print(f"  Query: {block.input.get('query', '')}")
+                try:
+                    text, is_error = scholar_gateway.call_tool(block.name, block.input)
+                except (RuntimeError, httpx.HTTPError) as exc:
+                    text, is_error = f"Tool call failed: {exc}", True
+                if verbose and not is_error:
+                    try:
+                        print(f"  Found: {json.loads(text).get('count', '?')} passages\n")
+                    except (json.JSONDecodeError, AttributeError):
+                        print()
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": text,
+                        "is_error": is_error,
+                    }
+                )
+            messages.append({"role": "user", "content": tool_results})
 
     return "Error: Maximum iterations reached without completing the research."
 
@@ -214,7 +167,7 @@ def main():
     print("\n" + "=" * 60)
     print("  Scholar Gateway Research Agent")
     print("  Answers questions using Wiley academic articles")
-    print("  Powered by Anthropic MCP Connector")
+    print("  Powered by Claude + Scholar Gateway")
     print("=" * 60 + "\n")
 
     # Check for API key
@@ -224,15 +177,9 @@ def main():
         print("  export ANTHROPIC_API_KEY='your-api-key'")
         sys.exit(1)
 
-    # Check for Scholar Gateway credentials (client_credentials preferred,
-    # legacy static token accepted as a fallback).
-    if not has_client_credentials() and not os.environ.get("SCHOLAR_GATEWAY_TOKEN"):
-        print("Error: no Scholar Gateway credentials configured.")
-        print(
-            "Set SCHOLAR_GATEWAY_CLIENT_ID and SCHOLAR_GATEWAY_CLIENT_SECRET "
-            "(preferred),"
-        )
-        print("or a legacy SCHOLAR_GATEWAY_TOKEN, in your .env file.")
+    # Check for the Scholar Gateway API key
+    if not has_api_key():
+        print(f"Error: {API_KEY_ENV} not set in your .env file.")
         print("See README.md for details.")
         sys.exit(1)
 

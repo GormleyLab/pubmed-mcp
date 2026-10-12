@@ -1,6 +1,6 @@
 # Research Agents
 
-Autonomous agents that search academic databases to answer research questions using the Anthropic MCP Connector.
+Autonomous agents that search academic databases to answer research questions using MCP servers (via the Anthropic MCP Connector, and client-side for Scholar Gateway).
 
 ## Overview
 
@@ -9,7 +9,7 @@ Four agents, each connecting to different academic databases:
 | Program | Database | Coverage | Authentication |
 |---------|----------|----------|----------------|
 | `pubmed.py` | PubMed | 36M+ biomedical citations | None required |
-| `scholar.py` | Scholar Gateway | 3M+ Wiley articles | OAuth required |
+| `scholar.py` | Scholar Gateway | 3M+ Wiley articles | API key required |
 | `jiminy.py` | Paper RAG | Personal paper library | API key required |
 | `research.py` | All three | Combined coverage | All keys recommended |
 
@@ -22,7 +22,7 @@ All agents:
 
 - Python 3.10+
 - Anthropic API key
-- Scholar Gateway token (for `scholar.py` only)
+- Scholar Gateway API key (for `scholar.py` only)
 - Paper RAG API key (for `jiminy.py` only)
 
 ## Installation
@@ -58,54 +58,30 @@ All agents:
 
 ### Required for `scholar.py` only
 
-Two ways to authenticate — `scholar.py` prefers the first and falls back to the second:
-
 | Variable | Description |
 |----------|-------------|
-| `SCHOLAR_GATEWAY_CLIENT_ID` | Client ID for the Wiley custom connector (preferred) |
-| `SCHOLAR_GATEWAY_CLIENT_SECRET` | Client Secret for the Wiley custom connector (preferred) |
-| `SCHOLAR_GATEWAY_TOKEN` | Legacy static OAuth token (fallback, optional) |
+| `SCHOLAR_GATEWAY_API_KEY` | API key issued by Wiley for the v2 custom connector |
 
-### Scholar Gateway authentication (client_credentials — preferred)
+### Scholar Gateway authentication
 
-Wiley's custom connector supports the OAuth2 **client_credentials** grant. This is a
-non-interactive, machine-to-machine flow: `scholar.py` exchanges your Client ID and
-Client Secret for a short-lived access token on every run, so there is no browser
-login and no token to manually refresh.
+Wiley's v2 custom connector (`https://custom-connector-v2.scholargateway.ai/mcp`,
+Streamable HTTP only) authenticates with a static API key sent in an `X-API-Key`
+header on every request. There is no OAuth token exchange and nothing to refresh.
 
-1. Add your credentials to `.env` (these are secrets — `.env` is git-ignored):
+1. Add the key to `.env` (it is a secret — `.env` is git-ignored; never commit it):
    ```
-   SCHOLAR_GATEWAY_CLIENT_ID=your-client-id
-   SCHOLAR_GATEWAY_CLIENT_SECRET=your-client-secret
+   SCHOLAR_GATEWAY_API_KEY=your-api-key
    ```
-2. Verify the OAuth step in isolation before running the agent:
+2. Verify connectivity before running the agent:
    ```bash
    python scholar_auth.py
    ```
-   A masked token is printed on success. The token exchange runs against
-   `https://custom-connector-v1.scholargateway.ai/oauth2/token`, and the agent
-   connects to `https://custom-connector-v1.scholargateway.ai/mcp`.
+   This runs an MCP handshake against the endpoint and lists the available
+   tools. The key is shown masked.
 
-### Legacy: getting a Scholar Gateway token via MCP Inspector (fallback)
-
-If you don't have client credentials, `scholar.py` falls back to a static
-`SCHOLAR_GATEWAY_TOKEN`. Scholar Gateway also supports OAuth 2.1 via CONNECT SSO;
-use the MCP Inspector to obtain an access token:
-
-```bash
-npx @modelcontextprotocol/inspector
-```
-
-1. For "Transport type", select "SSE" or "Streamable HTTP"
-2. Enter URL: `https://connector.scholargateway.ai/mcp`
-3. Click "Open Auth Settings" after "Need to configure authentication?"
-4. Click "Quick OAuth Flow" and authorize via CONNECT SSO
-5. Follow the steps until "Authentication complete"
-6. Copy the `access_token` value from the result
-7. Paste it as the value of `SCHOLAR_GATEWAY_TOKEN` in your `.env` file
-
-**Note:** These static tokens expire. You'll need to repeat this process when the
-token expires — which is why the client_credentials flow above is preferred.
+**Note:** Don't paste the key into hosted, third-party MCP inspector websites. If
+you want a GUI, run the official inspector locally with
+`npx @modelcontextprotocol/inspector`.
 
 ## Usage
 
@@ -180,7 +156,7 @@ python research.py
 - Cross-referencing findings between databases
 - When you're unsure which database has the most relevant content
 
-**Note:** Requires `ANTHROPIC_API_KEY`. `PAPERRAG_API_KEY` and `SCHOLAR_GATEWAY_TOKEN` are recommended but optional — the agent will use whichever databases are configured.
+**Note:** Requires `ANTHROPIC_API_KEY`. `PAPERRAG_API_KEY` and `SCHOLAR_GATEWAY_API_KEY` are recommended but optional — the agent will use whichever databases are configured.
 
 ## Example Questions
 
@@ -211,19 +187,26 @@ python research.py
 │  Claude Agent   │────▶│  MCP Connector (Anthropic API)   │
 └────────┬────────┘     └──────────────────────────────────┘
          │                        │
-         │              ┌─────────┼─────────┐
-         │              ▼         ▼         ▼
-         │      ┌──────────┐ ┌──────────┐ ┌───────────────────┐
-         │      │  PubMed  │ │ Paper RAG│ │  Scholar Gateway  │
-         │      └──────────┘ └──────────┘ └───────────────────┘
+         │              ┌─────────┴─────────┐
+         │              ▼                   ▼
+         │      ┌──────────┐         ┌──────────┐
+         │      │  PubMed  │         │ Paper RAG│
+         │      └──────────┘         └──────────┘
          │
+         │  client-side tool calls (X-API-Key)
+         ├─────────────────────────▶┌───────────────────┐
+         │                          │  Scholar Gateway  │
+         │                          └───────────────────┘
          ▼
 ┌─────────────────┐
 │ Cited Answer    │
 └─────────────────┘
 ```
 
-1. **MCP Server Connection**: Each agent connects to its respective MCP server
+1. **MCP Server Connection**: PubMed and Paper RAG are reached through
+   Anthropic's server-side MCP connector. Scholar Gateway's v2 endpoint requires
+   an `X-API-Key` header, which the connector can't send, so `scholar_auth.py`
+   talks to it directly and the agent executes its tool calls locally
 2. **Tool Discovery**: Servers provide search and metadata tools
 3. **Agentic Loop**: Claude autonomously calls tools until it has enough information
 4. **Citation Synthesis**: Final response includes proper academic citations
@@ -282,7 +265,7 @@ of **1 instance** (keeps one warm) rather than scaling to zero.
 
 | Tool | Description |
 |------|-------------|
-| `semantic_search` | Semantic search across Wiley's article database |
+| `search_wiley_fulltext` | Semantic search over the full text of Wiley articles; returns passages with citation metadata |
 
 ## As a Module
 

@@ -6,22 +6,26 @@ An autonomous agent that searches across multiple academic databases to answer r
 Uses the Anthropic MCP Connector to connect to:
 - PubMed: Biomedical literature database
 - Paper RAG: Personal academic paper library
-- Scholar Gateway: Wiley academic articles
+- Scholar Gateway: Wiley academic articles (client-side, X-API-Key auth)
 
 The agent ONLY uses search results from these databases to answer questions - it does not rely on
 its internal knowledge for research facts.
 """
 
+import json
 import os
 import sys
+
+import httpx
 
 from dotenv import load_dotenv
 from anthropic import Anthropic
 
 from scholar_auth import (
-    SCHOLAR_GATEWAY_MCP_URL,
-    get_scholar_gateway_token,
-    has_client_credentials,
+    API_KEY_ENV,
+    ScholarGatewayClient,
+    get_scholar_gateway_api_key,
+    has_api_key,
 )
 from paperrag_warmup import PAPERRAG_MCP_SERVER_URL, warm_up_paperrag
 
@@ -38,7 +42,7 @@ except (AttributeError, ValueError):
 # MCP Server URLs
 PUBMED_MCP_SERVER_URL = "https://pubmed.mcp.claude.com/mcp"
 # PAPERRAG_MCP_SERVER_URL is imported from paperrag_warmup (single source of truth)
-SCHOLAR_GATEWAY_MCP_SERVER_URL = SCHOLAR_GATEWAY_MCP_URL  # Wiley custom connector
+# Scholar Gateway is called client-side (see scholar_auth.py)
 
 SYSTEM_PROMPT = """You are an academic research assistant that answers questions using ONLY information from multiple research databases.
 
@@ -71,7 +75,7 @@ Paper RAG (paper_rag):
 - Use for: Questions about papers in the user's personal library
 
 Scholar Gateway (scholar_gateway):
-- semantic_search: Semantic search through Wiley articles
+- search_wiley_fulltext: Semantic full-text search through Wiley articles
 - Use for: Multi-disciplinary research questions, Wiley journal content
 
 WORKFLOW:
@@ -139,22 +143,25 @@ def run_research_agent(research_question: str, verbose: bool = True) -> str:
     if paperrag_api_key:
         warm_up_paperrag(paperrag_api_key, verbose=verbose)
 
-    # Obtain a Scholar Gateway token. Prefer the client_credentials flow (custom
-    # connector); fall back to a legacy static token. If neither is available, we
-    # simply omit Scholar Gateway so it can't fail the whole request — the MCP
-    # connector rejects the entire call if any one server's auth is invalid.
-    scholar_gateway_token = None
-    if has_client_credentials():
+    # Connect to Scholar Gateway client-side: the v2 server requires an
+    # X-API-Key header, which the server-side MCP connector cannot send. Its
+    # tools are offered as regular client tools and executed locally. If the
+    # key is missing or the connection fails, Scholar Gateway is simply omitted.
+    scholar_gateway = None
+    scholar_tools = []
+    if has_api_key():
         try:
-            scholar_gateway_token = get_scholar_gateway_token()
-        except RuntimeError as exc:
+            scholar_gateway = ScholarGatewayClient(get_scholar_gateway_api_key())
+            scholar_tools = scholar_gateway.list_tools()
+        except (RuntimeError, httpx.HTTPError) as exc:
+            if scholar_gateway:
+                scholar_gateway.close()
+            scholar_gateway = None
             if verbose:
-                print(f"Warning: could not obtain Scholar Gateway token: {exc}\n")
-    else:
-        scholar_gateway_token = os.environ.get("SCHOLAR_GATEWAY_TOKEN")
+                print(f"Warning: could not connect to Scholar Gateway: {exc}\n")
+    scholar_tool_names = {t["name"] for t in scholar_tools}
 
-    # Build MCP servers list. PubMed and Paper RAG are always included; Scholar
-    # Gateway is added only when a token was obtained.
+    # Build MCP servers list for the server-side connector (PubMed, Paper RAG).
     # Authorization tokens are kept secret in .env file.
     mcp_servers = [
         {
@@ -169,39 +176,44 @@ def run_research_agent(research_question: str, verbose: bool = True) -> str:
             "authorization_token": paperrag_api_key,
         },
     ]
-    if scholar_gateway_token:
-        mcp_servers.append(
-            {
-                "type": "url",
-                "url": SCHOLAR_GATEWAY_MCP_SERVER_URL,
-                "name": "scholar_gateway",
-                "authorization_token": scholar_gateway_token,
-            }
-        )
 
     # Warn if API keys/tokens are missing
     if not paperrag_api_key and verbose:
         print("Warning: PAPERRAG_API_KEY not set. Paper RAG will not be available.\n")
-    if not scholar_gateway_token and verbose:
+    if not has_api_key() and verbose:
         print(
-            "Warning: no Scholar Gateway credentials "
-            "(SCHOLAR_GATEWAY_CLIENT_ID/SECRET or SCHOLAR_GATEWAY_TOKEN). "
+            f"Warning: {API_KEY_ENV} not set. "
             "Scholar Gateway will not be available.\n"
         )
 
-    # Build tools list to match the servers that were actually configured.
+    # Server-side MCP toolsets plus any client-side Scholar Gateway tools.
     tools = [
         {"type": "mcp_toolset", "mcp_server_name": "pubmed"},
         {"type": "mcp_toolset", "mcp_server_name": "paper_rag"},
+        *scholar_tools,
     ]
-    if scholar_gateway_token:
-        tools.append({"type": "mcp_toolset", "mcp_server_name": "scholar_gateway"})
 
-    # Agentic loop. The server-side MCP connector usually finishes in a single
-    # turn (tools run server-side), so this rarely iterates more than once; the
-    # cap only bounds pause_turn resumptions.
+    try:
+        return _research_loop(
+            client, messages, mcp_servers, tools, scholar_gateway,
+            scholar_tool_names, verbose,
+        )
+    finally:
+        if scholar_gateway:
+            scholar_gateway.close()
+
+
+def _research_loop(
+    client, messages, mcp_servers, tools, scholar_gateway, scholar_tool_names,
+    verbose,
+) -> str:
+    """
+    Agentic loop. PubMed and Paper RAG tools run server-side inside a single
+    response; Scholar Gateway tool calls stop the turn with stop_reason
+    "tool_use", are executed locally, and their results are sent back.
+    """
     iteration = 0
-    max_iterations = 5  # Safety limit
+    max_iterations = 10  # Safety limit
 
     while iteration < max_iterations:
         iteration += 1
@@ -253,14 +265,6 @@ def run_research_agent(research_question: str, verbose: bool = True) -> str:
                     elif block.name == "get_paper_details":
                         key = block.input.get("bibtex_key", "")
                         print(f"  BibTeX Key: {key}")
-                    elif (
-                        block.name == "semantic_search"
-                        or block.name == "semanticSearch"
-                    ):
-                        query = block.input.get(
-                            "query", block.input.get("search_query", "")
-                        )
-                        print(f"  Query: {query}")
 
             elif block.type == "mcp_tool_result":
                 if verbose:
@@ -269,8 +273,6 @@ def run_research_agent(research_question: str, verbose: bool = True) -> str:
                         for content_block in block.content:
                             if hasattr(content_block, "text"):
                                 try:
-                                    import json
-
                                     result_data = json.loads(content_block.text)
                                     if "articles" in result_data:
                                         print(
@@ -310,6 +312,41 @@ def run_research_agent(research_question: str, verbose: bool = True) -> str:
         # the assistant's partial content (no canned "continue" prompt needed).
         if response.stop_reason == "pause_turn":
             messages.append({"role": "assistant", "content": assistant_content})
+            continue
+
+        # Client-side Scholar Gateway tool calls: run them and send back results.
+        if response.stop_reason == "tool_use":
+            messages.append({"role": "assistant", "content": assistant_content})
+            tool_results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                if verbose:
+                    print(f"[scholar_gateway] {block.name}")
+                    print(f"  Query: {block.input.get('query', '')}")
+                if block.name not in scholar_tool_names or not scholar_gateway:
+                    text, is_error = f"Unknown tool: {block.name}", True
+                else:
+                    try:
+                        text, is_error = scholar_gateway.call_tool(
+                            block.name, block.input
+                        )
+                    except (RuntimeError, httpx.HTTPError) as exc:
+                        text, is_error = f"Tool call failed: {exc}", True
+                if verbose and not is_error:
+                    try:
+                        print(f"  Found: {json.loads(text).get('count', '?')} passages\n")
+                    except (json.JSONDecodeError, AttributeError):
+                        print()
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": text,
+                        "is_error": is_error,
+                    }
+                )
+            messages.append({"role": "user", "content": tool_results})
             continue
 
         # Any other stop reason (e.g. max_tokens): return whatever text we have.

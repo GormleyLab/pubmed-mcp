@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-Scholar Gateway authentication helper.
+Scholar Gateway client helper.
 
-Fetches a Scholar Gateway access token using the OAuth2 client_credentials grant
-against Wiley's custom connector endpoint. This is a non-interactive,
-machine-to-machine flow: the Client ID and Client Secret are read from the
-environment (never hardcoded, never logged), exchanged for a short-lived access
-token, and that token is used as the MCP Connector authorization token.
+Wiley's v2 custom connector authenticates with a static API key sent in an
+X-API-Key header on every request (no OAuth token exchange). The key is read
+from the environment (never hardcoded, never logged).
 
-Run this module directly to smoke-test just the OAuth step:
+The Anthropic MCP connector can only send an `Authorization: Bearer` header,
+which the v2 server rejects, so Scholar Gateway is called client-side: this
+module speaks MCP (JSON-RPC over Streamable HTTP) directly with httpx, exposes
+the server's tools as regular Anthropic tool definitions, and executes the
+tool calls the model makes.
+
+Run this module directly to smoke-test connectivity:
 
     python scholar_auth.py
 """
 
-import base64
+import json
 import os
 
 import httpx
@@ -21,133 +25,160 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Non-secret endpoint URLs (safe to keep in source).
-SCHOLAR_GATEWAY_MCP_URL = "https://custom-connector-v1.scholargateway.ai/mcp"
-SCHOLAR_GATEWAY_TOKEN_URL = (
-    "https://custom-connector-v1.scholargateway.ai/oauth2/token"
-    "?grant_type=client_credentials"
-)
+# Non-secret endpoint URL (safe to keep in source). Streamable HTTP only; no SSE.
+SCHOLAR_GATEWAY_MCP_URL = "https://custom-connector-v2.scholargateway.ai/mcp"
 
-# Environment variable names holding the secret credentials (values live in .env).
-CLIENT_ID_ENV = "SCHOLAR_GATEWAY_CLIENT_ID"
-CLIENT_SECRET_ENV = "SCHOLAR_GATEWAY_CLIENT_SECRET"
+# Environment variable name holding the secret API key (value lives in .env).
+API_KEY_ENV = "SCHOLAR_GATEWAY_API_KEY"
+
+MCP_PROTOCOL_VERSION = "2025-06-18"
 
 
-def has_client_credentials() -> bool:
-    """Return True if both client-credential env vars are set."""
-    return bool(os.environ.get(CLIENT_ID_ENV)) and bool(
-        os.environ.get(CLIENT_SECRET_ENV)
-    )
+def has_api_key() -> bool:
+    """Return True if the Scholar Gateway API key env var is set."""
+    return bool(os.environ.get(API_KEY_ENV))
 
 
-def get_scholar_gateway_token(timeout: float = 30.0) -> str:
+def get_scholar_gateway_api_key() -> str:
     """
-    Fetch a Scholar Gateway access token via the client_credentials grant.
-
-    Reads SCHOLAR_GATEWAY_CLIENT_ID and SCHOLAR_GATEWAY_CLIENT_SECRET from the
-    environment and exchanges them at the token endpoint.
-
-    Wiley has not published whether the credentials belong in the HTTP Basic
-    auth header or the form body, so we try Basic auth first and fall back to
-    sending the credentials in the body if the server rejects it.
-
-    Returns:
-        The access token string.
+    Return the Scholar Gateway API key from the environment.
 
     Raises:
-        RuntimeError: if the credentials are missing or the token request fails.
-                      The error includes the HTTP status and response body, but
-                      never the client secret or the token itself.
+        RuntimeError: if the key is not set. The message names the variable,
+                      never its value.
     """
-    client_id = os.environ.get(CLIENT_ID_ENV)
-    client_secret = os.environ.get(CLIENT_SECRET_ENV)
-
-    if not client_id or not client_secret:
+    key = os.environ.get(API_KEY_ENV)
+    if not key:
         raise RuntimeError(
-            f"Missing Scholar Gateway credentials. Set {CLIENT_ID_ENV} and "
-            f"{CLIENT_SECRET_ENV} in your .env file."
+            f"Missing Scholar Gateway API key. Set {API_KEY_ENV} in your .env file."
         )
+    return key
 
-    with httpx.Client(timeout=timeout) as client:
-        # Attempt 1: HTTP Basic auth header (RFC 6749 preferred method).
-        basic = base64.b64encode(
-            f"{client_id}:{client_secret}".encode("utf-8")
-        ).decode("ascii")
-        resp = client.post(
-            SCHOLAR_GATEWAY_TOKEN_URL,
-            headers={
-                "Authorization": f"Basic {basic}",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-            },
-            data={"grant_type": "client_credentials"},
+
+class ScholarGatewayClient:
+    """
+    Minimal MCP client for the Scholar Gateway v2 endpoint.
+
+    Errors raised from here include the HTTP status and response body, never
+    the request headers (which carry the API key).
+    """
+
+    def __init__(self, api_key: str, timeout: float = 90.0):
+        self._headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "X-API-Key": api_key,
+        }
+        self._http = httpx.Client(timeout=timeout)
+        self._next_id = 1
+        self._initialize()
+
+    def close(self) -> None:
+        self._http.close()
+
+    def __enter__(self) -> "ScholarGatewayClient":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def _post(self, payload: dict) -> httpx.Response:
+        resp = self._http.post(
+            SCHOLAR_GATEWAY_MCP_URL, headers=self._headers, json=payload
         )
-
-        # Attempt 2: some servers expect the credentials in the body instead.
-        if resp.status_code in (400, 401):
-            resp = client.post(
-                SCHOLAR_GATEWAY_TOKEN_URL,
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json",
-                },
-                data={
-                    "grant_type": "client_credentials",
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                },
+        if resp.status_code not in (200, 202):
+            raise RuntimeError(
+                f"Scholar Gateway request '{payload.get('method')}' failed "
+                f"(HTTP {resp.status_code}): {resp.text[:500]}"
             )
+        return resp
 
-    if resp.status_code != 200:
-        # Body may reveal what the server expected (e.g. a missing scope);
-        # it does not contain our secret.
-        raise RuntimeError(
-            f"Scholar Gateway token request failed (HTTP {resp.status_code}): "
-            f"{resp.text}"
+    def _request(self, method: str, params: dict | None = None) -> dict:
+        """Send a JSON-RPC request and return its `result`."""
+        payload = {"jsonrpc": "2.0", "id": self._next_id, "method": method}
+        self._next_id += 1
+        if params is not None:
+            payload["params"] = params
+        resp = self._post(payload)
+
+        # Responses arrive as plain JSON or as a single SSE "data:" event.
+        body = resp.text
+        for line in body.splitlines():
+            if line.startswith("data:"):
+                body = line[len("data:"):].strip()
+                break
+        try:
+            message = json.loads(body)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Scholar Gateway returned a non-JSON response to '{method}'."
+            ) from exc
+        if "error" in message:
+            raise RuntimeError(
+                f"Scholar Gateway error on '{method}': {message['error']}"
+            )
+        return message.get("result", {})
+
+    def _initialize(self) -> None:
+        self._request(
+            "initialize",
+            {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "pubmed-mcp", "version": "1.0"},
+            },
         )
+        # Session-bound servers return an Mcp-Session-Id; the v2 server is
+        # stateless, so there is nothing to carry forward.
+        self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
-    try:
-        payload = resp.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Scholar Gateway token endpoint returned non-JSON response: {resp.text}"
-        ) from exc
+    def list_tools(self) -> list[dict]:
+        """Return the server's tools as Anthropic tool definitions."""
+        tools = self._request("tools/list").get("tools", [])
+        return [
+            {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "input_schema": t["inputSchema"],
+            }
+            for t in tools
+        ]
 
-    token = payload.get("access_token")
-    if not token:
-        raise RuntimeError(
-            f"Scholar Gateway token response missing 'access_token'. "
-            f"Keys returned: {sorted(payload.keys())}"
+    def call_tool(self, name: str, arguments: dict) -> tuple[str, bool]:
+        """Call a tool. Returns (text content, is_error)."""
+        result = self._request("tools/call", {"name": name, "arguments": arguments})
+        text = "\n".join(
+            block.get("text", "")
+            for block in result.get("content", [])
+            if block.get("type") == "text"
         )
-
-    return token
+        return text, bool(result.get("isError"))
 
 
 def _mask(token: str) -> str:
-    """Mask a token for safe display (first/last 4 chars)."""
+    """Mask a secret for safe display (first/last 4 chars)."""
     if len(token) <= 8:
         return "*" * len(token)
     return f"{token[:4]}...{token[-4:]}"
 
 
 def main() -> None:
-    """Smoke-test the OAuth step in isolation."""
-    if not has_client_credentials():
-        print(
-            f"Error: {CLIENT_ID_ENV} and {CLIENT_SECRET_ENV} must be set in .env."
-        )
+    """Smoke-test the connection: handshake and list tools."""
+    if not has_api_key():
+        print(f"Error: {API_KEY_ENV} must be set in .env.")
         raise SystemExit(1)
 
-    print("Requesting Scholar Gateway token via client_credentials...")
-    print(f"Token endpoint: {SCHOLAR_GATEWAY_TOKEN_URL}")
+    key = get_scholar_gateway_api_key()
+    print(f"Endpoint: {SCHOLAR_GATEWAY_MCP_URL}")
+    print(f"API key:  {_mask(key)}\n")
     try:
-        token = get_scholar_gateway_token()
-    except RuntimeError as exc:
-        print(f"\nFAILED: {exc}")
+        with ScholarGatewayClient(key) as sg:
+            tools = sg.list_tools()
+    except (RuntimeError, httpx.HTTPError) as exc:
+        print(f"FAILED: {exc}")
         raise SystemExit(1)
 
-    print(f"\nToken acquired: {_mask(token)}")
-    print("OAuth client_credentials flow works.")
+    print(f"Connected. Tools: {[t['name'] for t in tools]}")
 
 
 if __name__ == "__main__":
