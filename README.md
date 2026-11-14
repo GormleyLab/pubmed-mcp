@@ -303,6 +303,31 @@ response = run_research_agent(
 )
 ```
 
+## Development agent configuration
+
+Project instructions live in [AGENTS.md](AGENTS.md). `CLAUDE.md` is the exact
+`@AGENTS.md` compatibility import for Claude Code. This README remains the
+reference for setup, usage, and operational behavior.
+
+Author repository development skills in `.agents/skills/` and generate their
+Claude Code mirrors in `.claude/skills/`; do not edit generated mirrors directly.
+No repository skills are currently included, so those directories and the sync
+manifest are omitted. From the repository root, using a Python 3.10+ environment:
+
+```bash
+.venv/bin/python -m unittest discover -s scripts -p test_sync_agent_config.py
+.venv/bin/python scripts/sync_agent_config.py --write
+.venv/bin/python scripts/sync_agent_config.py --check
+```
+
+After adding or updating skills, review and commit the canonical skills,
+generated mirrors, and `.agents/skills-sync-manifest.json` together. The sync
+tool and tests are copied unchanged from the `geppetto-ecosystem` master; make
+tooling fixes there before copying both files here.
+
+GitHub Actions runs the regression tests and configuration check for pull
+requests and pushes to `main`. This workflow does not deploy or publish anything.
+
 ## License
 
 MIT
